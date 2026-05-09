@@ -44,14 +44,16 @@ $(HDD_IMG): kernel.elf
 	parted -s $(HDD_IMG) mklabel msdos
 	parted -s $(HDD_IMG) mkpart primary fat32 2048s 100%
 	parted -s $(HDD_IMG) set 1 boot on
-	mkfs.fat -F 32 $(HDD_IMG) -S 512 -s 8 -n SUNSETOS 2>/dev/null || true
+	sudo losetup -f --show -P $(HDD_IMG) > /tmp/loopdev.txt
+	sudo mkfs.fat -F 32 $$(cat /tmp/loopdev.txt)p1 -S 512 -s 8 -n SUNSETOS
 	sudo mkdir -p $(MOUNT_DIR)
-	sudo mount -o loop,offset=1048576 $(HDD_IMG) $(MOUNT_DIR)
+	sudo mount $$(cat /tmp/loopdev.txt)p1 $(MOUNT_DIR)
 	sudo mkdir -p $(MOUNT_DIR)/boot/grub
 	sudo cp kernel.elf $(MOUNT_DIR)/boot/
 	sudo cp grub.cfg $(MOUNT_DIR)/boot/grub/
 	sudo $(GRUB_INSTALL) --target=i386-pc --boot-directory=$(MOUNT_DIR)/boot --root-directory=$(MOUNT_DIR) --no-floppy $(HDD_IMG)
 	sudo umount $(MOUNT_DIR)
+	sudo losetup -d $$(cat /tmp/loopdev.txt)
 
 hda: kernel.elf $(HDD_IMG)
 	@echo "Hard disk image created with GRUB and kernel"
