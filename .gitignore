@@ -1,0 +1,9 @@
+
+build/
+iso/
+*.iso
+*.elf
+*.o
+test.asm
+test.o
+test.elf
