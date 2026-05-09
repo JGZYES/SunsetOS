@@ -5,7 +5,7 @@
 namespace ata {
 
 void init();
-bool read_sector(uint16_t drive, uint32_t lba, uint8_t* buffer);
-bool write_sector(uint16_t drive, uint32_t lba, const uint8_t* buffer);
+void read_sector(uint16_t drive, uint32_t lba, uint8_t* buffer);
+void write_sector(uint16_t drive, uint32_t lba, const uint8_t* buffer);
 
 }

@@ -7,3 +7,4 @@ iso/
 *.elf
 *.iso
 *.img
+src/kernel/ntfs-3g
