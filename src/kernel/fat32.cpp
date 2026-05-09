@@ -7,6 +7,7 @@ namespace fat32 {
 
 static BPB bpb;
 static uint16_t current_drive = 0;
+static uint32_t partition_lba = 0;
 static char current_path[256] = "/";
 static bool fs_initialized = false;
 static bool use_memory_fs = false;
@@ -27,7 +28,7 @@ static uint32_t get_total_sectors() {
 }
 
 static uint32_t get_fat_start_sector() {
-    return bpb.reserved_sectors;
+    return partition_lba + bpb.reserved_sectors;
 }
 
 static uint32_t get_data_start_sector() {
@@ -205,22 +206,43 @@ bool init() {
     
     ata::read_sector(current_drive, 0, buffer);
     
-    bool is_all_zero = true;
-    for (int i = 0; i < SECTOR_SIZE; i++) {
-        if (buffer[i] != 0) {
-            is_all_zero = false;
-            break;
-        }
-    }
+    MBR* mbr = reinterpret_cast<MBR*>(buffer);
     
-    memcpy(&bpb, buffer, sizeof(BPB));
-    
-    if (is_all_zero || memcmp(bpb.fs_type, "FAT32   ", 8) != 0) {
-        vga::print("No FAT32 filesystem found, using memory filesystem\n");
+    if (mbr->signature != 0xAA55) {
+        vga::print("Invalid MBR signature, using memory filesystem\n");
         use_memory_fs = true;
         fs_initialized = true;
         return true;
     }
+    
+    uint32_t fat32_lba = 0;
+    for (int i = 0; i < 4; i++) {
+        if (mbr->partitions[i].type == 0x0B || mbr->partitions[i].type == 0x0C) {
+            fat32_lba = mbr->partitions[i].start_lba;
+            vga::print("Found FAT32 partition at LBA %d\n", fat32_lba);
+            break;
+        }
+    }
+    
+    if (fat32_lba == 0) {
+        vga::print("No FAT32 partition found in MBR, using memory filesystem\n");
+        use_memory_fs = true;
+        fs_initialized = true;
+        return true;
+    }
+    
+    ata::read_sector(current_drive, fat32_lba, buffer);
+    
+    memcpy(&bpb, buffer, sizeof(BPB));
+    
+    if (memcmp(bpb.fs_type, "FAT32   ", 8) != 0) {
+        vga::print("Not a FAT32 filesystem (found: %.8s), using memory filesystem\n", bpb.fs_type);
+        use_memory_fs = true;
+        fs_initialized = true;
+        return true;
+    }
+    
+    partition_lba = fat32_lba;
     
     vga::print("FAT32 filesystem detected:\n");
     vga::print("  Bytes per sector: %d\n", bpb.bytes_per_sector);
@@ -766,6 +788,17 @@ void print_filesystem_info() {
 void format_drive(uint16_t drive) {
     vga::print("Formatting drive %d as FAT32...\n", drive);
     
+    uint32_t fat32_start = 2048;
+    
+    MBR mbr = {0};
+    mbr.partitions[0].status = 0x80;
+    mbr.partitions[0].type = 0x0C;
+    mbr.partitions[0].start_lba = fat32_start;
+    mbr.partitions[0].sector_count = 2097152;
+    mbr.signature = 0xAA55;
+    
+    ata::write_sector(drive, 0, reinterpret_cast<uint8_t*>(&mbr));
+    
     uint8_t boot_sector[SECTOR_SIZE] = {0};
     
     BPB* new_bpb = reinterpret_cast<BPB*>(boot_sector);
@@ -783,7 +816,7 @@ void format_drive(uint16_t drive) {
     new_bpb->sectors_per_fat_16 = 0;
     new_bpb->sectors_per_track = 63;
     new_bpb->num_heads = 255;
-    new_bpb->hidden_sectors = 0;
+    new_bpb->hidden_sectors = fat32_start;
     new_bpb->total_sectors_32 = 2097152;
     new_bpb->sectors_per_fat_32 = 4096;
     new_bpb->flags = 0;
@@ -800,7 +833,7 @@ void format_drive(uint16_t drive) {
     boot_sector[510] = 0x55;
     boot_sector[511] = 0xAA;
     
-    ata::write_sector(drive, 0, boot_sector);
+    ata::write_sector(drive, fat32_start, boot_sector);
     
     uint8_t fs_info[SECTOR_SIZE] = {0};
     fs_info[0] = 0x52;
@@ -812,19 +845,19 @@ void format_drive(uint16_t drive) {
     fs_info[508] = 0x55;
     fs_info[509] = 0xAA;
     
-    ata::write_sector(drive, 1, fs_info);
+    ata::write_sector(drive, fat32_start + 1, fs_info);
     
     uint8_t fat_buffer[SECTOR_SIZE] = {0};
     *(uint32_t*)fat_buffer = 0x0FFFFFF8;
     *(uint32_t*)(fat_buffer + 4) = 0x0FFFFFFF;
     
     for (uint32_t i = 0; i < new_bpb->sectors_per_fat_32; i++) {
-        ata::write_sector(drive, new_bpb->reserved_sectors + i, fat_buffer);
+        ata::write_sector(drive, fat32_start + new_bpb->reserved_sectors + i, fat_buffer);
     }
     
     uint8_t root_dir[SECTOR_SIZE * 8] = {0};
     
-    uint32_t root_sector = new_bpb->reserved_sectors + (new_bpb->num_fats * new_bpb->sectors_per_fat_32);
+    uint32_t root_sector = fat32_start + new_bpb->reserved_sectors + (new_bpb->num_fats * new_bpb->sectors_per_fat_32);
     for (uint32_t i = 0; i < 8; i++) {
         ata::write_sector(drive, root_sector + i, root_dir + i * SECTOR_SIZE);
     }

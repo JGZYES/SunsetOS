@@ -61,6 +61,23 @@ constexpr uint8_t ATTR_ARCHIVE = 0x20;
 
 constexpr uint32_t FAT_EOC = 0x0FFFFFFF;
 
+struct MBRPartition {
+    uint8_t status;
+    uint8_t start_head;
+    uint16_t start_sector_cylinder;
+    uint8_t type;
+    uint8_t end_head;
+    uint16_t end_sector_cylinder;
+    uint32_t start_lba;
+    uint32_t sector_count;
+} __attribute__((packed));
+
+struct MBR {
+    uint8_t bootstrap[446];
+    MBRPartition partitions[4];
+    uint16_t signature;
+} __attribute__((packed));
+
 bool init();
 bool is_ready();
 
