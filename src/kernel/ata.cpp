@@ -76,7 +76,7 @@ bool read_sector(uint16_t drive, uint32_t lba, uint8_t* buffer) {
     outb(ATA_LBA_LOW, (uint8_t)(lba & 0xFF));
     outb(ATA_LBA_MID, (uint8_t)((lba >> 8) & 0xFF));
     outb(ATA_LBA_HIGH, (uint8_t)((lba >> 16) & 0xFF));
-    outb(ATA_CMD, 0x24);
+    outb(ATA_CMD, 0x20);
 
     uint8_t status = wait_drq();
     if ((status & 0x01) || (status & 0x20)) {
@@ -102,7 +102,7 @@ bool write_sector(uint16_t drive, uint32_t lba, const uint8_t* buffer) {
     outb(ATA_LBA_LOW, (uint8_t)(lba & 0xFF));
     outb(ATA_LBA_MID, (uint8_t)((lba >> 8) & 0xFF));
     outb(ATA_LBA_HIGH, (uint8_t)((lba >> 16) & 0xFF));
-    outb(ATA_CMD, 0x34);
+    outb(ATA_CMD, 0x30);
 
     uint8_t status = wait_drq();
     if ((status & 0x01) || (status & 0x20)) {

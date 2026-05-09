@@ -1,9 +1,9 @@
-
 build/
+kernel.elf
+sunsetos.iso
+sunsetos_hdd.img
 iso/
-*.iso
-*.elf
 *.o
-test.asm
-test.o
-test.elf
+*.elf
+*.iso
+*.img
