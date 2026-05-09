@@ -2,11 +2,13 @@ CC := gcc
 LD := ld
 QEMU := qemu-system-x86_64
 GRUB_MKRESCUE := grub-mkrescue
+GRUB_INSTALL := grub-install
 
 SRC_DIR := src
 BUILD_DIR := build
 ISO_DIR := iso
 HDD_IMG := sunsetos_hdd.img
+MOUNT_DIR := /mnt/sunsetos_hdd
 INCLUDE_DIR := $(SRC_DIR)/kernel/include
 
 KERNEL_SOURCES := $(wildcard $(SRC_DIR)/kernel/*.cpp) $(wildcard $(SRC_DIR)/kernel/sqlite/*.cpp)
@@ -21,7 +23,7 @@ all: kernel.elf
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
-	mkkdir -p $(BUILD_DIR)/kernel
+	mkdir -p $(BUILD_DIR)/kernel
 	mkdir -p $(BUILD_DIR)/kernel/sqlite
 
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp $(BUILD_DIR)
@@ -42,33 +44,17 @@ $(HDD_IMG): kernel.elf
 	parted -s $(HDD_IMG) mklabel msdos
 	parted -s $(HDD_IMG) mkpart primary fat32 2048s 100%
 	parted -s $(HDD_IMG) set 1 boot on
-	$(QEMU) -drive format=raw,file=$(HDD_IMG),index=0,if=ide -m 2G -nographic &
-	sleep 2
-	$(QEMU) -drive format=raw,file=$(HDD_IMG),index=0,if=ide -m 2G -nographic -monitor stdio -serial stdio <<EOF
-quit
-EOF
+	mkfs.fat -F 32 $(HDD_IMG) -S 512 -s 8 -n SUNSETOS 2>/dev/null || true
+	sudo mkdir -p $(MOUNT_DIR)
+	sudo mount -o loop,offset=1048576 $(HDD_IMG) $(MOUNT_DIR)
+	sudo mkdir -p $(MOUNT_DIR)/boot/grub
+	sudo cp kernel.elf $(MOUNT_DIR)/boot/
+	sudo cp grub.cfg $(MOUNT_DIR)/boot/grub/
+	sudo $(GRUB_INSTALL) --target=i386-pc --boot-directory=$(MOUNT_DIR)/boot --root-directory=$(MOUNT_DIR) --no-floppy $(HDD_IMG)
+	sudo umount $(MOUNT_DIR)
 
-hda: kernel.elf
-	dd if=/dev/zero of=$(HDD_IMG) bs=1M count=100 2>/dev/null || true
-	python3 -c "
-import struct
-with open('$(HDD_IMG)', 'r+b') as f:
-    f.seek(0x1BE)
-    partitions = [
-        0x80, 0x01, 0x01, 0x00, 0x0C, 0xFE, 0xFF, 0xFF,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x55, 0xAA
-    ]
-    f.write(bytearray(partitions))
-"
-	qemu-img resize $(HDD_IMG) 100M 2>/dev/null || true
-	$(QEMU) -hda $(HDD_IMG) -m 2G &
+hda: kernel.elf $(HDD_IMG)
+	@echo "Hard disk image created with GRUB and kernel"
 
 run-hda: $(HDD_IMG)
 	$(QEMU) -hda $(HDD_IMG) -m 2G
@@ -83,3 +69,4 @@ install: kernel.elf
 
 clean:
 	rm -rf $(BUILD_DIR) kernel.elf $(ISO_DIR) sunsetos.iso $(HDD_IMG)
+	sudo rm -rf $(MOUNT_DIR)
