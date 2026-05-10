@@ -156,7 +156,7 @@ static void cmd_fedit(int argc) {
         strcat(content, args[i]);
     }
     
-    if (fat32::write_file(args[1], reinterpret_cast<uint8_t*>(content), strlen(content)) != 0) {
+    if (!fat32::write_file(args[1], reinterpret_cast<uint8_t*>(content), strlen(content))) {
         vga::print("Error: Cannot write to file '%s'\n", args[1]);
     } else {
         vga::print("File '%s' written\n", args[1]);
@@ -176,7 +176,7 @@ static void cmd_rm(int argc) {
         vga::print("Usage: rm <filename>\n");
         return;
     }
-    if (fat32::delete_file(args[1]) != 0) {
+    if (!fat32::delete_file(args[1])) {
         vga::print("Error: Cannot delete '%s'\n", args[1]);
     } else {
         vga::print("'%s' deleted\n", args[1]);

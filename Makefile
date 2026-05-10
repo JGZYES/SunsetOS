@@ -32,12 +32,12 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp $(BUILD_DIR)
 kernel.elf: $(KERNEL_OBJECTS) linker.ld
 	$(LD) $(LDFLAGS) -o $@ $(KERNEL_OBJECTS)
 
-run: kernel.elf
+run: kernel.elf $(HDD_IMG)
 	mkdir -p $(ISO_DIR)/boot/grub
 	cp kernel.elf $(ISO_DIR)/boot/
 	cp grub.cfg $(ISO_DIR)/boot/grub/
 	$(GRUB_MKRESCUE) -o sunsetos.iso $(ISO_DIR)
-	$(QEMU) -cdrom sunsetos.iso -m 2G
+	$(QEMU) -cdrom sunsetos.iso -drive file=$(HDD_IMG),format=raw,if=ide -m 2G
 
 $(HDD_IMG): kernel.elf
 	dd if=/dev/zero of=$(HDD_IMG) bs=1M count=100 2>/dev/null

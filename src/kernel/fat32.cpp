@@ -43,72 +43,79 @@ static uint32_t get_bytes_per_cluster() {
     return bpb.bytes_per_sector * bpb.sectors_per_cluster;
 }
 
+static bool read_sector(uint32_t lba, uint8_t* buffer) {
+    if (ata::read_sectors(current_drive, lba, 1, buffer) != 0) {
+        return false;
+    }
+    return true;
+}
+
+static bool write_sector(uint32_t lba, const uint8_t* buffer) {
+    if (ata::write_sectors(current_drive, lba, 1, buffer) != 0) {
+        return false;
+    }
+    return true;
+}
+
 static uint32_t get_fat_entry(uint32_t cluster) {
-    if (cluster == 0) return 0;
+    if (!fs_initialized || cluster < 2) return FAT_EOC;
+
     uint32_t fat_offset = cluster * 4;
     uint32_t fat_sector = get_fat_start_sector() + (fat_offset / SECTOR_SIZE);
     uint32_t offset_in_sector = fat_offset % SECTOR_SIZE;
-    
+
     uint8_t buffer[SECTOR_SIZE];
-    ata::read_sector(current_drive, fat_sector, buffer);
-    
+    if (!read_sector(fat_sector, buffer)) {
+        return FAT_EOC;
+    }
+
     return *(uint32_t*)(buffer + offset_in_sector) & 0x0FFFFFFF;
 }
 
-static void set_fat_entry(uint32_t cluster, uint32_t value) {
+static bool set_fat_entry(uint32_t cluster, uint32_t value) {
+    if (!fs_initialized || cluster < 2) return false;
+
     uint32_t fat_offset = cluster * 4;
     uint32_t fat_sector = get_fat_start_sector() + (fat_offset / SECTOR_SIZE);
     uint32_t offset_in_sector = fat_offset % SECTOR_SIZE;
-    
+
     uint8_t buffer[SECTOR_SIZE];
-    ata::read_sector(current_drive, fat_sector, buffer);
-    
+    if (!read_sector(fat_sector, buffer)) {
+        return false;
+    }
+
     *(uint32_t*)(buffer + offset_in_sector) = value & 0x0FFFFFFF;
-    
-    ata::write_sector(current_drive, fat_sector, buffer);
+
+    if (!write_sector(fat_sector, buffer)) {
+        return false;
+    }
+
+    return true;
 }
 
 static uint32_t find_free_cluster() {
+    if (!fs_initialized) return 0;
+
     uint32_t fat_sectors = bpb.sectors_per_fat_32;
     uint8_t buffer[SECTOR_SIZE];
-    
+
     for (uint32_t sector = get_fat_start_sector(); sector < get_fat_start_sector() + fat_sectors; sector++) {
-        ata::read_sector(current_drive, sector, buffer);
-        
+        if (!read_sector(sector, buffer)) {
+            return 0;
+        }
+
         for (uint32_t i = 0; i < SECTOR_SIZE; i += 4) {
             uint32_t entry = *(uint32_t*)(buffer + i) & 0x0FFFFFFF;
             if (entry == 0) {
                 uint32_t cluster = ((sector - get_fat_start_sector()) * SECTOR_SIZE + i) / 4;
-                set_fat_entry(cluster, FAT_EOC);
-                return cluster;
+                if (set_fat_entry(cluster, FAT_EOC)) {
+                    return cluster;
+                }
+                return 0;
             }
         }
     }
-    
-    return 0;
-}
 
-static int read_cluster(uint32_t cluster, uint8_t* buffer) {
-    if (cluster < 2) return -1;
-    
-    uint32_t sector = get_data_start_sector() + (cluster - 2) * get_sectors_per_cluster();
-    
-    for (uint32_t i = 0; i < get_sectors_per_cluster(); i++) {
-        ata::read_sector(current_drive, sector + i, buffer + i * SECTOR_SIZE);
-    }
-    
-    return 0;
-}
-
-static int write_cluster(uint32_t cluster, const uint8_t* buffer) {
-    if (cluster < 2) return -1;
-    
-    uint32_t sector = get_data_start_sector() + (cluster - 2) * get_sectors_per_cluster();
-    
-    for (uint32_t i = 0; i < get_sectors_per_cluster(); i++) {
-        ata::write_sector(current_drive, sector + i, buffer + i * SECTOR_SIZE);
-    }
-    
     return 0;
 }
 
@@ -126,12 +133,12 @@ static void short_to_long_name(const uint8_t* short_name, char* long_name) {
 
 static void long_to_short_name(const char* name, uint8_t* short_name) {
     memset(short_name, ' ', 11);
-    
+
     int i = 0;
     int j = 0;
     bool has_ext = false;
     int ext_start = 0;
-    
+
     while (name[i] != '\0' && i < 12) {
         if (name[i] == '.') {
             has_ext = true;
@@ -143,7 +150,7 @@ static void long_to_short_name(const char* name, uint8_t* short_name) {
             short_name[j] = toupper(name[i]);
             j++;
         } else if (has_ext && (j - 8) < 3) {
-            short_name[8 + (j - 8)] = toupper(name[i]);
+            short_name[j] = toupper(name[i]);
             j++;
         }
         i++;
@@ -151,109 +158,152 @@ static void long_to_short_name(const char* name, uint8_t* short_name) {
 }
 
 static int find_directory_entry(const char* path, uint32_t* start_cluster, uint32_t* entry_index) {
+    if (!fs_initialized) return -1;
+
     char path_copy[256];
     strcpy(path_copy, path);
-    
+
     char* token = strtok(path_copy, "/");
     uint32_t current_cluster = bpb.root_cluster;
-    
+
     if (!token) {
         *start_cluster = current_cluster;
         *entry_index = -1;
         return 0;
     }
-    
+
     while (token) {
-        uint8_t buffer[SECTOR_SIZE * 4];
+        uint8_t buffer[SECTOR_SIZE];
         uint32_t cluster = current_cluster;
-        
-        while (cluster != FAT_EOC) {
-            if (read_cluster(cluster, buffer) != 0) {
+        bool found = false;
+
+        while (cluster != FAT_EOC && cluster != 0) {
+            if (!read_sector(get_data_start_sector() + (cluster - 2) * get_sectors_per_cluster(), buffer)) {
                 return -1;
             }
-            
+
             DirectoryEntry* entries = reinterpret_cast<DirectoryEntry*>(buffer);
-            for (int i = 0; i < (int)(get_bytes_per_cluster() / sizeof(DirectoryEntry)); i++) {
+            for (int i = 0; i < (int)(SECTOR_SIZE / sizeof(DirectoryEntry)); i++) {
                 if (entries[i].name[0] == 0x00) break;
                 if (entries[i].name[0] == 0xE5) continue;
-                
+
                 char entry_name[13];
                 short_to_long_name(entries[i].name, entry_name);
-                
+
                 if (strcmp(entry_name, token) == 0) {
                     current_cluster = (entries[i].first_cluster_high << 16) | entries[i].first_cluster_low;
                     token = strtok(nullptr, "/");
-                    goto next_token;
+                    found = true;
+                    break;
                 }
             }
-            
+
+            if (found) break;
             cluster = get_fat_entry(cluster);
         }
-        
-        return -1;
-        
-next_token:
-        continue;
+
+        if (!found) {
+            return -1;
+        }
     }
-    
+
     *start_cluster = current_cluster;
     *entry_index = -1;
     return 0;
 }
 
 bool init() {
+    vga::print("Initializing FAT32 filesystem...\n");
+
+    memset(&bpb, 0, sizeof(bpb));
+    bpb.bytes_per_sector = 512;
+    bpb.sectors_per_cluster = 8;
+    bpb.reserved_sectors = 32;
+    bpb.num_fats = 2;
+    bpb.sectors_per_fat_32 = 4096;
+    bpb.root_cluster = 2;
+    memcpy(bpb.fs_type, "FAT32   ", 8);
+    memcpy(bpb.volume_label, "SUNSETOS   ", 11);
+
+    ata::init();
+
     uint8_t buffer[SECTOR_SIZE];
-    
-    ata::read_sector(current_drive, 0, buffer);
-    
+
+    if (!ata::disk_present()) {
+        vga::print("No disk present, using memory filesystem\n");
+        use_memory_fs = true;
+        fs_initialized = true;
+        return true;
+    }
+
+    vga::print("Disk detected, reading MBR...\n");
+
+    if (!read_sector(0, buffer)) {
+        vga::print("Failed to read MBR, using memory filesystem\n");
+        use_memory_fs = true;
+        fs_initialized = true;
+        return true;
+    }
+
     MBR* mbr = reinterpret_cast<MBR*>(buffer);
-    
+
     if (mbr->signature != 0xAA55) {
         vga::print("Invalid MBR signature, using memory filesystem\n");
         use_memory_fs = true;
         fs_initialized = true;
         return true;
     }
-    
+
     uint32_t fat32_lba = 0;
     for (int i = 0; i < 4; i++) {
+        vga::print("Partition %d: type=0x%02X, start_lba=%u\n", i, mbr->partitions[i].type, mbr->partitions[i].start_lba);
         if (mbr->partitions[i].type == 0x0B || mbr->partitions[i].type == 0x0C) {
             fat32_lba = mbr->partitions[i].start_lba;
-            vga::print("Found FAT32 partition at LBA %d\n", fat32_lba);
+            vga::print("Found FAT32 partition at LBA %u\n", fat32_lba);
             break;
         }
     }
-    
+
     if (fat32_lba == 0) {
-        vga::print("No FAT32 partition found in MBR, using memory filesystem\n");
+        vga::print("No FAT32 partition found, using memory filesystem\n");
         use_memory_fs = true;
         fs_initialized = true;
         return true;
     }
-    
-    ata::read_sector(current_drive, fat32_lba, buffer);
-    
+
+    vga::print("Reading FAT32 BPB from LBA %u...\n", fat32_lba);
+
+    if (!read_sector(fat32_lba, buffer)) {
+        vga::print("Failed to read FAT32 BPB, using memory filesystem\n");
+        use_memory_fs = true;
+        fs_initialized = true;
+        return true;
+    }
+
     memcpy(&bpb, buffer, sizeof(BPB));
-    
+
+    vga::print("FS Type: %.8s\n", bpb.fs_type);
+    vga::print("Bytes per sector: %u\n", bpb.bytes_per_sector);
+    vga::print("Sectors per cluster: %u\n", bpb.sectors_per_cluster);
+    vga::print("Reserved sectors: %u\n", bpb.reserved_sectors);
+    vga::print("Number of FATs: %u\n", bpb.num_fats);
+    vga::print("Total sectors: %u\n", get_total_sectors());
+    vga::print("Sectors per FAT: %u\n", bpb.sectors_per_fat_32);
+    vga::print("Root cluster: %u\n", bpb.root_cluster);
+
     if (memcmp(bpb.fs_type, "FAT32   ", 8) != 0) {
-        vga::print("Not a FAT32 filesystem (found: %.8s), using memory filesystem\n", bpb.fs_type);
+        vga::print("Not a FAT32 filesystem, using memory filesystem\n");
         use_memory_fs = true;
         fs_initialized = true;
         return true;
     }
-    
+
     partition_lba = fat32_lba;
-    
-    vga::print("FAT32 filesystem detected:\n");
-    vga::print("  Bytes per sector: %d\n", bpb.bytes_per_sector);
-    vga::print("  Sectors per cluster: %d\n", bpb.sectors_per_cluster);
-    vga::print("  Reserved sectors: %d\n", bpb.reserved_sectors);
-    vga::print("  Number of FATs: %d\n", bpb.num_fats);
-    vga::print("  Sectors per FAT: %d\n", bpb.sectors_per_fat_32);
-    vga::print("  Root cluster: %d\n", bpb.root_cluster);
-    vga::print("  Total sectors: %d\n", get_total_sectors());
-    
     fs_initialized = true;
+    use_memory_fs = false;
+
+    vga::print("FAT32 filesystem initialized successfully!\n");
+
     return true;
 }
 
@@ -261,497 +311,343 @@ bool is_ready() {
     return fs_initialized;
 }
 
-int list_directory(const char* path, void (*callback)(const char*, uint8_t, uint32_t)) {
-    if (!fs_initialized) return -1;
-    
+bool list_directory(const char* path, void (*callback)(const char*, uint8_t, uint32_t)) {
+    if (!fs_initialized) return false;
+
     if (use_memory_fs) {
         MemoryFile* file = root_directory;
         while (file) {
             callback(file->name, file->attributes, file->size);
             file = file->next;
         }
-        return 0;
+        return true;
     }
-    
+
     uint32_t start_cluster;
     uint32_t entry_index;
-    
+
     if (find_directory_entry(path, &start_cluster, &entry_index) != 0) {
-        return -1;
+        return false;
     }
-    
-    uint8_t buffer[SECTOR_SIZE * 4];
+
+    uint8_t buffer[SECTOR_SIZE];
     uint32_t cluster = start_cluster;
-    
-    while (cluster != FAT_EOC) {
-        if (read_cluster(cluster, buffer) != 0) {
-            return -1;
+
+    while (cluster != FAT_EOC && cluster != 0) {
+        if (!read_sector(get_data_start_sector() + (cluster - 2) * get_sectors_per_cluster(), buffer)) {
+            return false;
         }
-        
+
         DirectoryEntry* entries = reinterpret_cast<DirectoryEntry*>(buffer);
-        for (int i = 0; i < (int)(get_bytes_per_cluster() / sizeof(DirectoryEntry)); i++) {
+        for (int i = 0; i < (int)(SECTOR_SIZE / sizeof(DirectoryEntry)); i++) {
             if (entries[i].name[0] == 0x00) break;
             if (entries[i].name[0] == 0xE5) continue;
             if ((entries[i].attributes & ATTR_VOLUME_ID) != 0) continue;
             if ((entries[i].attributes & ATTR_HIDDEN) != 0) continue;
-            if ((entries[i].attributes & ATTR_SYSTEM) != 0) continue;
-            
+
             char name[13];
             short_to_long_name(entries[i].name, name);
-            
+
             callback(name, entries[i].attributes, entries[i].file_size);
         }
-        
+
         cluster = get_fat_entry(cluster);
     }
-    
-    return 0;
+
+    return true;
 }
 
-int create_directory(const char* path) {
-    if (!fs_initialized) return -1;
-    
-    if (use_memory_fs) {
-        MemoryFile* new_dir = new MemoryFile();
-        strcpy(new_dir->name, path);
-        new_dir->attributes = ATTR_DIRECTORY;
-        new_dir->data = nullptr;
-        new_dir->size = 0;
-        new_dir->capacity = 0;
-        new_dir->next = root_directory;
-        root_directory = new_dir;
-        return 0;
-    }
-    
-    char path_copy[256];
-    strcpy(path_copy, path);
-    
-    char* dirname = strrchr(path_copy, '/');
-    char* parent_path = path_copy;
-    if (dirname) {
-        *dirname = '\0';
-        dirname++;
-    } else {
-        dirname = path_copy;
-        parent_path = "/";
-    }
-    
-    uint32_t parent_cluster;
-    uint32_t entry_index;
-    
-    if (find_directory_entry(parent_path, &parent_cluster, &entry_index) != 0) {
-        return -1;
-    }
-    
-    uint32_t cluster = parent_cluster;
-    uint8_t buffer[SECTOR_SIZE * 4];
-    
-    while (cluster != FAT_EOC) {
-        if (read_cluster(cluster, buffer) != 0) {
-            return -1;
-        }
-        
-        DirectoryEntry* entries = reinterpret_cast<DirectoryEntry*>(buffer);
-        for (int i = 0; i < (int)(get_bytes_per_cluster() / sizeof(DirectoryEntry)); i++) {
-            if (entries[i].name[0] == 0x00 || entries[i].name[0] == 0xE5) {
-                uint32_t new_cluster = find_free_cluster();
-                if (new_cluster == 0) {
-                    return -1;
-                }
-                
-                long_to_short_name(dirname, entries[i].name);
-                entries[i].attributes = ATTR_DIRECTORY;
-                entries[i].first_cluster_low = new_cluster & 0xFFFF;
-                entries[i].first_cluster_high = (new_cluster >> 16) & 0xFFFF;
-                entries[i].file_size = 0;
-                
-                write_cluster(cluster, buffer);
-                
-                uint8_t new_dir_buffer[SECTOR_SIZE * 4] = {0};
-                write_cluster(new_cluster, new_dir_buffer);
-                
-                return 0;
-            }
-        }
-        
-        uint32_t next_cluster = get_fat_entry(cluster);
-        if (next_cluster == FAT_EOC) {
-            uint32_t new_cluster = find_free_cluster();
-            if (new_cluster == 0) {
-                return -1;
-            }
-            set_fat_entry(cluster, new_cluster);
-            memset(buffer, 0, sizeof(buffer));
-            write_cluster(new_cluster, buffer);
-            cluster = new_cluster;
-        } else {
-            cluster = next_cluster;
-        }
-    }
-    
-    return -1;
-}
+bool create_file(const char* path, uint8_t attributes) {
+    if (!fs_initialized) return false;
 
-int create_file(const char* path, uint8_t attributes) {
-    if (!fs_initialized) return -1;
-    
     if (use_memory_fs) {
-        MemoryFile* new_file = new MemoryFile();
-        strcpy(new_file->name, path);
-        new_file->attributes = attributes;
-        new_file->data = nullptr;
-        new_file->size = 0;
-        new_file->capacity = 0;
-        new_file->next = root_directory;
-        root_directory = new_file;
-        return 0;
+        MemoryFile* file = new MemoryFile();
+        strcpy(file->name, path);
+        file->attributes = attributes;
+        file->data = nullptr;
+        file->size = 0;
+        file->capacity = 0;
+        file->next = root_directory;
+        root_directory = file;
+        return true;
     }
-    
+
     char path_copy[256];
     strcpy(path_copy, path);
-    
-    char* filename = strrchr(path_copy, '/');
-    char* dir_path = path_copy;
-    if (filename) {
-        *filename = '\0';
-        filename++;
+
+    char* last_slash = strrchr(path_copy, '/');
+    const char* filename;
+    char dir_path[256];
+
+    if (last_slash) {
+        *last_slash = '\0';
+        strcpy(dir_path, path_copy);
+        filename = last_slash + 1;
     } else {
+        strcpy(dir_path, "/");
         filename = path_copy;
-        dir_path = "/";
     }
-    
+
     uint32_t dir_cluster;
-    uint32_t entry_index;
-    
-    if (find_directory_entry(dir_path, &dir_cluster, &entry_index) != 0) {
-        return -1;
+    uint32_t dummy;
+
+    if (find_directory_entry(dir_path, &dir_cluster, &dummy) != 0) {
+        return false;
     }
-    
-    uint32_t cluster = dir_cluster;
-    uint8_t buffer[SECTOR_SIZE * 4];
-    
-    while (cluster != FAT_EOC) {
-        if (read_cluster(cluster, buffer) != 0) {
-            return -1;
+
+    uint32_t cluster = find_free_cluster();
+    if (cluster == 0) {
+        return false;
+    }
+
+    uint8_t buffer[SECTOR_SIZE] = {0};
+    for (uint32_t i = 0; i < get_sectors_per_cluster(); i++) {
+        if (!write_sector(get_data_start_sector() + (cluster - 2) * get_sectors_per_cluster() + i, buffer)) {
+            set_fat_entry(cluster, 0);
+            return false;
         }
-        
-        DirectoryEntry* entries = reinterpret_cast<DirectoryEntry*>(buffer);
-        for (int i = 0; i < (int)(get_bytes_per_cluster() / sizeof(DirectoryEntry)); i++) {
+    }
+
+    uint8_t dir_buffer[SECTOR_SIZE];
+    uint32_t current_cluster = dir_cluster;
+
+    while (current_cluster != FAT_EOC && current_cluster != 0) {
+        if (!read_sector(get_data_start_sector() + (current_cluster - 2) * get_sectors_per_cluster(), dir_buffer)) {
+            return false;
+        }
+
+        DirectoryEntry* entries = reinterpret_cast<DirectoryEntry*>(dir_buffer);
+        for (int i = 0; i < (int)(SECTOR_SIZE / sizeof(DirectoryEntry)); i++) {
             if (entries[i].name[0] == 0x00 || entries[i].name[0] == 0xE5) {
-                uint32_t new_cluster = find_free_cluster();
-                if (new_cluster == 0) {
-                    return -1;
-                }
-                
                 long_to_short_name(filename, entries[i].name);
                 entries[i].attributes = attributes;
-                entries[i].first_cluster_low = new_cluster & 0xFFFF;
-                entries[i].first_cluster_high = (new_cluster >> 16) & 0xFFFF;
+                entries[i].first_cluster_low = cluster & 0xFFFF;
+                entries[i].first_cluster_high = (cluster >> 16) & 0xFFFF;
                 entries[i].file_size = 0;
-                
-                write_cluster(cluster, buffer);
-                return 0;
+
+                if (!write_sector(get_data_start_sector() + (current_cluster - 2) * get_sectors_per_cluster(), dir_buffer)) {
+                    return false;
+                }
+
+                return true;
             }
         }
-        
-        uint32_t next_cluster = get_fat_entry(cluster);
-        if (next_cluster == FAT_EOC) {
+
+        uint32_t next_cluster = get_fat_entry(current_cluster);
+        if (next_cluster == FAT_EOC || next_cluster == 0) {
             uint32_t new_cluster = find_free_cluster();
             if (new_cluster == 0) {
-                return -1;
+                return false;
             }
-            set_fat_entry(cluster, new_cluster);
-            memset(buffer, 0, sizeof(buffer));
-            write_cluster(new_cluster, buffer);
-            cluster = new_cluster;
+
+            set_fat_entry(current_cluster, new_cluster);
+
+            memset(dir_buffer, 0, SECTOR_SIZE);
+            if (!write_sector(get_data_start_sector() + (new_cluster - 2) * get_sectors_per_cluster(), dir_buffer)) {
+                return false;
+            }
+
+            current_cluster = new_cluster;
         } else {
-            cluster = next_cluster;
+            current_cluster = next_cluster;
         }
     }
-    
-    return -1;
+
+    return false;
 }
 
-int delete_file(const char* path) {
-    if (!fs_initialized) return -1;
-    
-    if (use_memory_fs) {
-        MemoryFile** ptr = &root_directory;
-        while (*ptr) {
-            if (strcmp((*ptr)->name, path) == 0) {
-                MemoryFile* temp = *ptr;
-                *ptr = (*ptr)->next;
-                delete[] temp->data;
-                delete temp;
-                return 0;
-            }
-            ptr = &(*ptr)->next;
-        }
-        return -1;
-    }
-    
-    char path_copy[256];
-    strcpy(path_copy, path);
-    
-    char* filename = strrchr(path_copy, '/');
-    char* dir_path = path_copy;
-    if (filename) {
-        *filename = '\0';
-        filename++;
-    } else {
-        filename = path_copy;
-        dir_path = "/";
-    }
-    
-    uint32_t dir_cluster;
-    uint32_t entry_index;
-    
-    if (find_directory_entry(dir_path, &dir_cluster, &entry_index) != 0) {
-        return -1;
-    }
-    
-    uint32_t cluster = dir_cluster;
-    uint8_t buffer[SECTOR_SIZE * 4];
-    
-    while (cluster != FAT_EOC) {
-        if (read_cluster(cluster, buffer) != 0) {
-            return -1;
-        }
-        
-        DirectoryEntry* entries = reinterpret_cast<DirectoryEntry*>(buffer);
-        for (int i = 0; i < (int)(get_bytes_per_cluster() / sizeof(DirectoryEntry)); i++) {
-            if (entries[i].name[0] == 0x00) break;
-            
-            char entry_name[13];
-            short_to_long_name(entries[i].name, entry_name);
-            
-            if (strcmp(entry_name, filename) == 0) {
-                uint32_t file_cluster = (entries[i].first_cluster_high << 16) | entries[i].first_cluster_low;
-                
-                while (file_cluster != FAT_EOC) {
-                    uint32_t next_cluster = get_fat_entry(file_cluster);
-                    set_fat_entry(file_cluster, 0);
-                    file_cluster = next_cluster;
-                }
-                
-                entries[i].name[0] = 0xE5;
-                write_cluster(cluster, buffer);
-                return 0;
-            }
-        }
-        
-        cluster = get_fat_entry(cluster);
-    }
-    
-    return -1;
+bool create_directory(const char* path) {
+    return create_file(path, ATTR_DIRECTORY);
 }
 
-int read_file(const char* path, uint8_t* buffer, uint32_t max_size, uint32_t* bytes_read) {
-    if (!fs_initialized) return -1;
-    
-    *bytes_read = 0;
-    
+bool read_file(const char* path, uint8_t* buffer, uint32_t max_size, uint32_t* bytes_read) {
+    if (!fs_initialized) return false;
+
     if (use_memory_fs) {
         MemoryFile* file = root_directory;
         while (file) {
             if (strcmp(file->name, path) == 0) {
-                *bytes_read = file->size < max_size ? file->size : max_size;
+                *bytes_read = (file->size < max_size) ? file->size : max_size;
                 memcpy(buffer, file->data, *bytes_read);
-                return 0;
+                return true;
             }
             file = file->next;
         }
-        return -1;
+        return false;
     }
-    
-    char path_copy[256];
-    strcpy(path_copy, path);
-    
-    char* filename = strrchr(path_copy, '/');
-    char* dir_path = path_copy;
-    if (filename) {
-        *filename = '\0';
-        filename++;
-    } else {
-        filename = path_copy;
-        dir_path = "/";
-    }
-    
-    uint32_t dir_cluster;
+
+    uint32_t start_cluster;
     uint32_t entry_index;
-    
-    if (find_directory_entry(dir_path, &dir_cluster, &entry_index) != 0) {
-        return -1;
+
+    if (find_directory_entry(path, &start_cluster, &entry_index) != 0) {
+        return false;
     }
-    
-    uint32_t cluster = dir_cluster;
-    uint8_t dir_buffer[SECTOR_SIZE * 4];
-    
-    while (cluster != FAT_EOC) {
-        if (read_cluster(cluster, dir_buffer) != 0) {
-            return -1;
-        }
-        
-        DirectoryEntry* entries = reinterpret_cast<DirectoryEntry*>(dir_buffer);
-        for (int i = 0; i < (int)(get_bytes_per_cluster() / sizeof(DirectoryEntry)); i++) {
-            if (entries[i].name[0] == 0x00) break;
-            
-            char entry_name[13];
-            short_to_long_name(entries[i].name, entry_name);
-            
-            if (strcmp(entry_name, filename) == 0) {
-                uint32_t file_cluster = (entries[i].first_cluster_high << 16) | entries[i].first_cluster_low;
-                uint32_t remaining = entries[i].file_size;
-                uint32_t offset = 0;
-                
-                while (file_cluster != FAT_EOC && remaining > 0 && offset < max_size) {
-                    uint8_t cluster_buffer[SECTOR_SIZE * 4];
-                    if (read_cluster(file_cluster, cluster_buffer) != 0) {
-                        return -1;
-                    }
-                    
-                    uint32_t to_copy = get_bytes_per_cluster();
-                    if (to_copy > remaining) to_copy = remaining;
-                    if (to_copy > max_size - offset) to_copy = max_size - offset;
-                    
-                    memcpy(buffer + offset, cluster_buffer, to_copy);
-                    offset += to_copy;
-                    remaining -= to_copy;
-                    
-                    file_cluster = get_fat_entry(file_cluster);
-                }
-                
-                *bytes_read = offset;
-                return 0;
+
+    uint8_t sector_buffer[SECTOR_SIZE];
+    uint32_t cluster = start_cluster;
+    uint32_t bytes_read_so_far = 0;
+
+    while (cluster != FAT_EOC && cluster != 0 && bytes_read_so_far < max_size) {
+        for (uint32_t i = 0; i < get_sectors_per_cluster(); i++) {
+            if (!read_sector(get_data_start_sector() + (cluster - 2) * get_sectors_per_cluster() + i, sector_buffer)) {
+                return false;
+            }
+
+            uint32_t bytes_to_copy = (max_size - bytes_read_so_far < SECTOR_SIZE) ? (max_size - bytes_read_so_far) : SECTOR_SIZE;
+            memcpy(buffer + bytes_read_so_far, sector_buffer, bytes_to_copy);
+            bytes_read_so_far += bytes_to_copy;
+
+            if (bytes_read_so_far >= max_size) {
+                *bytes_read = bytes_read_so_far;
+                return true;
             }
         }
-        
+
         cluster = get_fat_entry(cluster);
     }
-    
-    return -1;
+
+    *bytes_read = bytes_read_so_far;
+    return true;
 }
 
-int write_file(const char* path, const uint8_t* data, uint32_t size) {
-    if (!fs_initialized) return -1;
-    
+bool write_file(const char* path, const uint8_t* data, uint32_t size) {
+    if (!fs_initialized) return false;
+
     if (use_memory_fs) {
         MemoryFile* file = root_directory;
         while (file) {
             if (strcmp(file->name, path) == 0) {
-                if (size > file->capacity) {
+                if (file->capacity < size) {
                     delete[] file->data;
                     file->data = new uint8_t[size];
                     file->capacity = size;
                 }
                 memcpy(file->data, data, size);
                 file->size = size;
-                return 0;
+                return true;
             }
             file = file->next;
         }
-        
-        create_file(path, ATTR_ARCHIVE);
-        return write_file(path, data, size);
+
+        file = new MemoryFile();
+        strcpy(file->name, path);
+        file->attributes = 0;
+        file->data = new uint8_t[size];
+        memcpy(file->data, data, size);
+        file->size = size;
+        file->capacity = size;
+        file->next = root_directory;
+        root_directory = file;
+        return true;
     }
-    
-    char path_copy[256];
-    strcpy(path_copy, path);
-    
-    char* filename = strrchr(path_copy, '/');
-    char* dir_path = path_copy;
-    if (filename) {
-        *filename = '\0';
-        filename++;
-    } else {
-        filename = path_copy;
-        dir_path = "/";
-    }
-    
-    uint32_t dir_cluster;
+
+    uint32_t start_cluster;
     uint32_t entry_index;
-    
-    if (find_directory_entry(dir_path, &dir_cluster, &entry_index) != 0) {
-        return -1;
-    }
-    
-    uint32_t cluster = dir_cluster;
-    uint8_t dir_buffer[SECTOR_SIZE * 4];
-    DirectoryEntry* found_entry = nullptr;
-    uint32_t found_cluster;
-    
-    while (cluster != FAT_EOC) {
-        if (read_cluster(cluster, dir_buffer) != 0) {
-            return -1;
+
+    if (find_directory_entry(path, &start_cluster, &entry_index) != 0) {
+        if (!create_file(path, 0)) {
+            return false;
         }
-        
-        DirectoryEntry* entries = reinterpret_cast<DirectoryEntry*>(dir_buffer);
-        for (int i = 0; i < (int)(get_bytes_per_cluster() / sizeof(DirectoryEntry)); i++) {
-            if (entries[i].name[0] == 0x00) break;
-            
-            char entry_name[13];
-            short_to_long_name(entries[i].name, entry_name);
-            
-            if (strcmp(entry_name, filename) == 0) {
-                found_entry = &entries[i];
-                found_cluster = cluster;
-                goto found;
+        if (find_directory_entry(path, &start_cluster, &entry_index) != 0) {
+            return false;
+        }
+    }
+
+    uint32_t total_clusters = (size + get_bytes_per_cluster() - 1) / get_bytes_per_cluster();
+    uint32_t current_cluster = start_cluster;
+
+    for (uint32_t i = 0; i < total_clusters; i++) {
+        uint8_t sector_buffer[SECTOR_SIZE] = {0};
+
+        for (uint32_t j = 0; j < get_sectors_per_cluster(); j++) {
+            uint32_t offset = i * get_bytes_per_cluster() + j * SECTOR_SIZE;
+            if (offset < size) {
+                uint32_t bytes_to_copy = (size - offset < SECTOR_SIZE) ? (size - offset) : SECTOR_SIZE;
+                memcpy(sector_buffer, data + offset, bytes_to_copy);
+            }
+
+            if (!write_sector(get_data_start_sector() + (current_cluster - 2) * get_sectors_per_cluster() + j, sector_buffer)) {
+                return false;
             }
         }
-        
-        cluster = get_fat_entry(cluster);
-    }
-    
-    return -1;
-    
-found:
-    uint32_t file_cluster = (found_entry->first_cluster_high << 16) | found_entry->first_cluster_low;
-    uint32_t remaining = size;
-    uint32_t offset = 0;
-    uint32_t current_cluster = file_cluster;
-    
-    while (remaining > 0) {
-        uint8_t cluster_buffer[SECTOR_SIZE * 4];
-        memset(cluster_buffer, 0, sizeof(cluster_buffer));
-        
-        uint32_t to_write = get_bytes_per_cluster();
-        if (to_write > remaining) to_write = remaining;
-        
-        memcpy(cluster_buffer, data + offset, to_write);
-        
-        if (write_cluster(current_cluster, cluster_buffer) != 0) {
-            return -1;
-        }
-        
-        offset += to_write;
-        remaining -= to_write;
-        
-        if (remaining > 0) {
-            uint32_t next_cluster = get_fat_entry(current_cluster);
-            if (next_cluster == FAT_EOC) {
-                uint32_t new_cluster = find_free_cluster();
-                if (new_cluster == 0) {
-                    return -1;
-                }
-                set_fat_entry(current_cluster, new_cluster);
-                next_cluster = new_cluster;
+
+        if (i < total_clusters - 1) {
+            uint32_t next_cluster = find_free_cluster();
+            if (next_cluster == 0) {
+                return false;
             }
+            set_fat_entry(current_cluster, next_cluster);
             current_cluster = next_cluster;
         }
     }
-    
-    found_entry->file_size = size;
-    write_cluster(found_cluster, dir_buffer);
-    
-    return 0;
+
+    return true;
 }
 
 const char* get_current_dir() {
     return current_path;
 }
 
-void set_current_dir(const char* path) {
-    strncpy(current_path, path, sizeof(current_path) - 1);
+bool set_current_dir(const char* path) {
+    if (!fs_initialized) return false;
+
+    uint32_t start_cluster;
+    uint32_t entry_index;
+
+    if (find_directory_entry(path, &start_cluster, &entry_index) != 0) {
+        return false;
+    }
+
+    strcpy(current_path, path);
+    return true;
+}
+
+bool delete_file(const char* path) {
+    if (!fs_initialized) return false;
+
+    if (use_memory_fs) {
+        MemoryFile* prev = nullptr;
+        MemoryFile* current = root_directory;
+        while (current) {
+            if (strcmp(current->name, path) == 0) {
+                if (prev) {
+                    prev->next = current->next;
+                } else {
+                    root_directory = current->next;
+                }
+                delete[] current->data;
+                delete current;
+                return true;
+            }
+            prev = current;
+            current = current->next;
+        }
+        return false;
+    }
+
+    uint32_t start_cluster;
+    uint32_t entry_index;
+
+    if (find_directory_entry(path, &start_cluster, &entry_index) != 0) {
+        return false;
+    }
+
+    uint8_t buffer[SECTOR_SIZE];
+    uint32_t sector = get_data_start_sector() + (start_cluster - 2) * get_sectors_per_cluster();
+    uint32_t offset_in_sector = (entry_index * sizeof(DirectoryEntry)) % SECTOR_SIZE;
+
+    if (!read_sector(sector + entry_index / (SECTOR_SIZE / sizeof(DirectoryEntry)), buffer)) {
+        return false;
+    }
+
+    DirectoryEntry* entry = reinterpret_cast<DirectoryEntry*>(buffer) + (entry_index % (SECTOR_SIZE / sizeof(DirectoryEntry)));
+    entry->name[0] = 0xE5;
+
+    if (!write_sector(sector + entry_index / (SECTOR_SIZE / sizeof(DirectoryEntry)), buffer)) {
+        return false;
+    }
+
+    return true;
 }
 
 void print_filesystem_info() {
@@ -759,48 +655,48 @@ void print_filesystem_info() {
         vga::print("Filesystem not initialized\n");
         return;
     }
-    
+
     if (use_memory_fs) {
-        vga::print("Using memory filesystem\n");
-        vga::print("Current directory: %s\n", current_path);
-        
-        int count = 0;
-        MemoryFile* file = root_directory;
-        while (file) {
-            count++;
-            file = file->next;
-        }
-        vga::print("Number of files: %d\n", count);
+        vga::print("Memory Filesystem Info:\n");
+        vga::print("  Type: In-Memory\n");
+        vga::print("  Status: Active\n");
     } else {
         vga::print("FAT32 Filesystem Info:\n");
-        vga::print("  Bytes per sector: %d\n", bpb.bytes_per_sector);
-        vga::print("  Sectors per cluster: %d\n", bpb.sectors_per_cluster);
-        vga::print("  Bytes per cluster: %d\n", get_bytes_per_cluster());
-        vga::print("  Number of FATs: %d\n", bpb.num_fats);
-        vga::print("  Sectors per FAT: %d\n", bpb.sectors_per_fat_32);
-        vga::print("  Root cluster: %d\n", bpb.root_cluster);
-        vga::print("  Total sectors: %d\n", get_total_sectors());
-        vga::print("  Total clusters: %d\n", (get_total_sectors() - get_data_start_sector()) / get_sectors_per_cluster());
-        vga::print("  Current directory: %s\n", current_path);
+        vga::print("  Bytes per sector: %u\n", bpb.bytes_per_sector);
+        vga::print("  Sectors per cluster: %u\n", bpb.sectors_per_cluster);
+        vga::print("  Reserved sectors: %u\n", bpb.reserved_sectors);
+        vga::print("  Number of FATs: %u\n", bpb.num_fats);
+        vga::print("  Total sectors: %u\n", get_total_sectors());
+        vga::print("  FAT size (sectors): %u\n", bpb.sectors_per_fat_32);
+        vga::print("  Volume label: %.11s\n", bpb.volume_label);
+        vga::print("  FS type: %.8s\n", bpb.fs_type);
     }
 }
 
 void format_drive(uint16_t drive) {
     vga::print("Formatting drive %d as FAT32...\n", drive);
-    
+
+    if (!ata::disk_present()) {
+        vga::print("No disk present, cannot format\n");
+        return;
+    }
+
     uint32_t fat32_start = 2048;
-    
+
     MBR mbr = {0};
     mbr.partitions[0].status = 0x80;
     mbr.partitions[0].type = 0x0C;
     mbr.partitions[0].start_lba = fat32_start;
     mbr.partitions[0].sector_count = 2097152;
     mbr.signature = 0xAA55;
-    
-    ata::write_sector(drive, 0, reinterpret_cast<uint8_t*>(&mbr));
-    
+
+    if (!write_sector(0, reinterpret_cast<uint8_t*>(&mbr))) {
+        vga::print("Failed to write MBR\n");
+        return;
+    }
+
     uint8_t boot_sector[SECTOR_SIZE] = {0};
-    
+
     BPB* new_bpb = reinterpret_cast<BPB*>(boot_sector);
     new_bpb->jump[0] = 0xEB;
     new_bpb->jump[1] = 0x3C;
@@ -829,12 +725,15 @@ void format_drive(uint16_t drive) {
     new_bpb->volume_id = 0x12345678;
     memcpy(new_bpb->volume_label, "SUNSETOS   ", 11);
     memcpy(new_bpb->fs_type, "FAT32   ", 8);
-    
+
     boot_sector[510] = 0x55;
     boot_sector[511] = 0xAA;
-    
-    ata::write_sector(drive, fat32_start, boot_sector);
-    
+
+    if (!write_sector(fat32_start, boot_sector)) {
+        vga::print("Failed to write boot sector\n");
+        return;
+    }
+
     uint8_t fs_info[SECTOR_SIZE] = {0};
     fs_info[0] = 0x52;
     fs_info[1] = 0x52;
@@ -844,29 +743,38 @@ void format_drive(uint16_t drive) {
     *(uint32_t*)(fs_info + 488) = 2;
     fs_info[508] = 0x55;
     fs_info[509] = 0xAA;
-    
-    ata::write_sector(drive, fat32_start + 1, fs_info);
-    
+
+    if (!write_sector(fat32_start + 1, fs_info)) {
+        vga::print("Failed to write FS info\n");
+        return;
+    }
+
     uint8_t fat_buffer[SECTOR_SIZE] = {0};
     *(uint32_t*)fat_buffer = 0x0FFFFFF8;
     *(uint32_t*)(fat_buffer + 4) = 0x0FFFFFFF;
-    
+
     for (uint32_t i = 0; i < new_bpb->sectors_per_fat_32; i++) {
-        ata::write_sector(drive, fat32_start + new_bpb->reserved_sectors + i, fat_buffer);
+        if (!write_sector(fat32_start + new_bpb->reserved_sectors + i, fat_buffer)) {
+            vga::print("Failed to write FAT sector\n");
+            return;
+        }
     }
-    
-    uint8_t root_dir[SECTOR_SIZE * 8] = {0};
-    
+
+    uint8_t root_dir[SECTOR_SIZE] = {0};
+
     uint32_t root_sector = fat32_start + new_bpb->reserved_sectors + (new_bpb->num_fats * new_bpb->sectors_per_fat_32);
     for (uint32_t i = 0; i < 8; i++) {
-        ata::write_sector(drive, root_sector + i, root_dir + i * SECTOR_SIZE);
+        if (!write_sector(root_sector + i, root_dir)) {
+            vga::print("Failed to write root directory\n");
+            return;
+        }
     }
-    
+
     vga::print("Drive formatted successfully!\n");
-    
+
     fs_initialized = false;
     use_memory_fs = false;
     init();
 }
 
-}
+} // namespace fat32
