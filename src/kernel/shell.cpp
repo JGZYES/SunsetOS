@@ -1,6 +1,6 @@
 #include "shell.h"
 #include "vga.h"
-#include "fat32.h"
+#include "fs.h"
 #include "kbd.h"
 #include "libc.h"
 #include "net.h"
@@ -19,10 +19,8 @@ static char* args[MAX_ARGS];
 
 void init() {
     vga::init();
-    if (!fat32::init()) {
-        vga::print("Warning: FAT32 filesystem not found, formatting...\n");
-        fat32::format_drive(0);
-        fat32::init();
+    if (!fs::init()) {
+        vga::print("Warning: Filesystem not found\n");
     }
     net::init();
     user::init();
@@ -55,7 +53,7 @@ static int parse_command(const char* cmd) {
 }
 
 static void ls_callback(const char* name, uint8_t attributes, uint32_t size) {
-    if (attributes & fat32::ATTR_DIRECTORY) {
+    if (attributes & 0x10) {  // 简化的目录判断
         vga::print("%s/\n", name);
     } else {
         vga::print("%s (%d bytes)\n", name, size);
@@ -93,8 +91,8 @@ static void cmd_help() {
 }
 
 static void cmd_ls(int argc) {
-    const char* path = (argc == 1) ? fat32::get_current_dir() : args[1];
-    if (fat32::list_directory(path, ls_callback) != 0) {
+    const char* path = (argc == 1) ? fs::get_current_dir() : args[1];
+    if (!fs::list_directory(path, ls_callback)) {
         vga::print("Error: Cannot list directory '%s'\n", path);
     }
 }
@@ -104,7 +102,7 @@ static void cmd_mkdir(int argc) {
         vga::print("Usage: mkdir <directory>\n");
         return;
     }
-    if (fat32::create_directory(args[1]) != 0) {
+    if (!fs::create_directory(args[1])) {
         vga::print("Error: Cannot create directory '%s'\n", args[1]);
     } else {
         vga::print("Directory '%s' created\n", args[1]);
@@ -116,7 +114,7 @@ static void cmd_mkfile(int argc) {
         vga::print("Usage: mkfile <filename>\n");
         return;
     }
-    if (fat32::create_file(args[1], fat32::ATTR_ARCHIVE) != 0) {
+    if (!fs::create_file(args[1], 0x20)) {  // 0x20 = ATTR_ARCHIVE
         vga::print("Error: Cannot create file '%s'\n", args[1]);
     } else {
         vga::print("File '%s' created\n", args[1]);
@@ -132,7 +130,7 @@ static void cmd_fview(int argc) {
     uint8_t buffer[4096];
     uint32_t bytes_read;
     
-    if (fat32::read_file(args[1], buffer, sizeof(buffer), &bytes_read) != 0) {
+    if (!fs::read_file(args[1], buffer, sizeof(buffer), &bytes_read)) {
         vga::print("Error: Cannot read file '%s'\n", args[1]);
         return;
     }
@@ -156,7 +154,7 @@ static void cmd_fedit(int argc) {
         strcat(content, args[i]);
     }
     
-    if (!fat32::write_file(args[1], reinterpret_cast<uint8_t*>(content), strlen(content))) {
+    if (!fs::write_file(args[1], reinterpret_cast<uint8_t*>(content), strlen(content))) {
         vga::print("Error: Cannot write to file '%s'\n", args[1]);
     } else {
         vga::print("File '%s' written\n", args[1]);
@@ -176,7 +174,7 @@ static void cmd_rm(int argc) {
         vga::print("Usage: rm <filename>\n");
         return;
     }
-    if (!fat32::delete_file(args[1])) {
+    if (!fs::delete_file(args[1])) {
         vga::print("Error: Cannot delete '%s'\n", args[1]);
     } else {
         vga::print("'%s' deleted\n", args[1]);
@@ -188,11 +186,11 @@ static void cmd_cd(int argc) {
         vga::print("Usage: cd <directory>\n");
         return;
     }
-    fat32::set_current_dir(args[1]);
+    fs::set_current_dir(args[1]);
 }
 
 static void cmd_pwd() {
-    vga::print("%s\n", fat32::get_current_dir());
+    vga::print("%s\n", fs::get_current_dir());
 }
 
 static void cmd_clear() {
@@ -298,7 +296,7 @@ static void cmd_exec(int argc) {
     uint8_t buffer[1024 * 1024];
     uint32_t bytes_read;
     
-    if (fat32::read_file(args[1], buffer, sizeof(buffer), &bytes_read) != 0) {
+    if (!fs::read_file(args[1], buffer, sizeof(buffer), &bytes_read)) {
         vga::print("Error: Cannot read file '%s'\n", args[1]);
         return;
     }
@@ -334,7 +332,7 @@ static void cmd_exec(int argc) {
 
 static void cmd_fsinfo(int argc) {
     (void)argc;
-    fat32::print_filesystem_info();
+    fs::print_filesystem_info();
 }
 
 static void cmd_format(int argc) {
@@ -356,7 +354,7 @@ static void cmd_format(int argc) {
     vga::newline();
     
     if (strcmp(confirm, "YES") == 0) {
-        fat32::format_drive(0);
+        fs::format_drive(0);
     } else {
         vga::print("Format cancelled\n");
     }
@@ -447,7 +445,7 @@ void run() {
     while (true) {
         vga::put_string(user::get_current_user(), vga::Color::LightBlue, vga::Color::Black);
         vga::put_string("@sunsetos:", vga::Color::Yellow, vga::Color::Black);
-        vga::put_string(fat32::get_current_dir(), vga::Color::LightGreen, vga::Color::Black);
+        vga::put_string(fs::get_current_dir(), vga::Color::LightGreen, vga::Color::Black);
         vga::put_string(" $ ", vga::Color::Yellow, vga::Color::Black);
 
         input_len = 0;

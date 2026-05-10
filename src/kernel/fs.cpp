@@ -1,358 +1,150 @@
 #include "fs.h"
+#include "ntfs.h"
+#include "fat32.h"
 #include "vga.h"
-#include "libc.h"
 
 namespace fs {
 
-static File files[MAX_FILES];
-static char current_path[MAX_PATH] = "/";
-static uint32_t root_file = 0;
-uint32_t free_file = 0;
+static FilesystemType current_fs = FS_NONE;
 
-void init() {
-    memset(files, 0, sizeof(files));
-    
-    for (size_t i = 0; i < MAX_FILES - 1; i++) {
-        files[i].next_file = i + 1;
-    }
-    files[MAX_FILES - 1].next_file = -1;
-    
-    strcpy(files[0].name, "/");
-    files[0].type = FileType::Directory;
-    files[0].size = 0;
-    files[0].parent_dir = -1;
-    files[0].next_file = -1;
-    files[0].first_child = -1;
-    root_file = 0;
-    strcpy(current_path, "/");
+FilesystemType get_fs_type() {
+    return current_fs;
 }
 
-static uint32_t allocate_file() {
-    if (free_file == -1) return -1;
-    uint32_t idx = free_file;
-    free_file = files[idx].next_file;
-    memset(&files[idx], 0, sizeof(File));
-    files[idx].next_file = -1;
-    files[idx].first_child = -1;
-    files[idx].parent_dir = -1;
-    return idx;
-}
-
-static void split_path(const char* path, char* dir_part, char* file_part) {
-    const char* last_slash = strrchr(path, '/');
-    if (last_slash == path) {
-        strcpy(dir_part, "/");
-        strcpy(file_part, path + 1);
-    } else if (last_slash) {
-        size_t dir_len = last_slash - path;
-        strncpy(dir_part, path, dir_len);
-        dir_part[dir_len] = '\0';
-        strcpy(file_part, last_slash + 1);
-    } else {
-        strcpy(dir_part, current_path);
-        strcpy(file_part, path);
+const char* get_fs_type_name() {
+    switch (current_fs) {
+        case FS_NTFS: return "NTFS";
+        case FS_FAT32: return "FAT32";
+        case FS_MEMORY: return "Memory";
+        default: return "None";
     }
 }
 
-static uint32_t find_file(const char* path, FileType type = FileType::None) {
-    if (strcmp(path, "/") == 0) return root_file;
-    
-    char temp[MAX_PATH];
-    strcpy(temp, path);
-    
-    uint32_t current = root_file;
-    char* token = strtok(temp, "/");
-    
-    while (token) {
-        bool found = false;
-        uint32_t child_idx = files[current].first_child;
-        
-        while (child_idx != -1) {
-            if (strcmp(files[child_idx].name, token) == 0) {
-                if (type == FileType::None || files[child_idx].type == type) {
-                    current = child_idx;
-                    found = true;
-                    break;
-                }
-            }
-            child_idx = files[child_idx].next_file;
+bool init() {
+    vga::print("Detecting filesystem...\n");
+
+    // 优先尝试 NTFS
+    if (ntfs::init()) {
+        if (ntfs::is_ready() && !ntfs::is_ready() == false) {  // 检查是否使用了真实的 NTFS 而不是内存
+            // 检查是否真的检测到了 NTFS
+            // 如果 ntfs::init() 返回 true 但是使用了内存文件系统，我们也继续
+            current_fs = FS_NTFS;
+            vga::print("Using NTFS filesystem\n");
+            return true;
         }
-        
-        if (!found) return -1;
-        token = strtok(nullptr, "/");
     }
-    
-    return current;
+
+    // 如果 NTFS 失败，尝试 FAT32
+    vga::print("NTFS not found, trying FAT32...\n");
+    if (fat32::init()) {
+        current_fs = FS_FAT32;
+        vga::print("Using FAT32 filesystem\n");
+        return true;
+    }
+
+    // 如果都失败了，使用内存文件系统
+    current_fs = FS_MEMORY;
+    vga::print("Using Memory filesystem\n");
+    return true;
 }
 
-static uint32_t find_dir(const char* path) {
-    return find_file(path, FileType::Directory);
+bool is_ready() {
+    switch (current_fs) {
+        case FS_NTFS: return ntfs::is_ready();
+        case FS_FAT32: return fat32::is_ready();
+        case FS_MEMORY: return true;
+        default: return false;
+    }
 }
 
-int mkdir(const char* path) {
-    char dir_part[MAX_PATH];
-    char name[MAX_FILENAME];
-    split_path(path, dir_part, name);
-    
-    if (strlen(name) >= MAX_FILENAME) {
-        vga::print("Error: filename too long\n");
-        return -1;
+bool list_directory(const char* path, void (*callback)(const char*, uint8_t, uint32_t)) {
+    switch (current_fs) {
+        case FS_NTFS: return ntfs::list_directory(path, callback);
+        case FS_FAT32: return fat32::list_directory(path, callback);
+        case FS_MEMORY: return ntfs::list_directory(path, callback);  // 使用 ntfs 的内存实现
+        default: return false;
     }
-    
-    uint32_t parent_idx = find_dir(dir_part);
-    if (parent_idx == -1) {
-        vga::print("Error: directory not found\n");
-        return -1;
-    }
-    
-    uint32_t child_idx = files[parent_idx].first_child;
-    while (child_idx != -1) {
-        if (strcmp(files[child_idx].name, name) == 0) {
-            vga::print("Error: file exists\n");
-            return -1;
-        }
-        child_idx = files[child_idx].next_file;
-    }
-    
-    uint32_t new_file = allocate_file();
-    if (new_file == -1) {
-        vga::print("Error: out of space\n");
-        return -1;
-    }
-    
-    strcpy(files[new_file].name, name);
-    files[new_file].type = FileType::Directory;
-    files[new_file].size = 0;
-    files[new_file].parent_dir = parent_idx;
-    
-    files[new_file].next_file = files[parent_idx].first_child;
-    files[parent_idx].first_child = new_file;
-    
-    return 0;
 }
 
-int mkfile(const char* path, const char* content) {
-    char dir_part[MAX_PATH];
-    char name[MAX_FILENAME];
-    split_path(path, dir_part, name);
-    
-    if (strlen(name) >= MAX_FILENAME) {
-        vga::print("Error: filename too long\n");
-        return -1;
+bool create_file(const char* path, uint8_t attributes) {
+    switch (current_fs) {
+        case FS_NTFS: return ntfs::create_file(path, attributes);
+        case FS_FAT32: return fat32::create_file(path, attributes);
+        case FS_MEMORY: return ntfs::create_file(path, attributes);
+        default: return false;
     }
-    
-    uint32_t parent_idx = find_dir(dir_part);
-    if (parent_idx == -1) {
-        vga::print("Error: directory not found\n");
-        return -1;
-    }
-    
-    uint32_t child_idx = files[parent_idx].first_child;
-    while (child_idx != -1) {
-        if (strcmp(files[child_idx].name, name) == 0) {
-            vga::print("Error: file exists\n");
-            return -1;
-        }
-        child_idx = files[child_idx].next_file;
-    }
-    
-    uint32_t new_file = allocate_file();
-    if (new_file == -1) {
-        vga::print("Error: out of space\n");
-        return -1;
-    }
-    
-    strcpy(files[new_file].name, name);
-    files[new_file].type = FileType::File;
-    files[new_file].parent_dir = parent_idx;
-    
-    if (content) {
-        size_t len = strlen(content);
-        if (len > MAX_FILE_SIZE) len = MAX_FILE_SIZE;
-        memcpy(files[new_file].data, content, len);
-        files[new_file].size = len;
-    } else {
-        files[new_file].size = 0;
-    }
-    
-    files[new_file].next_file = files[parent_idx].first_child;
-    files[parent_idx].first_child = new_file;
-    
-    return 0;
 }
 
-int ls(const char* path) {
-    uint32_t dir_idx = find_dir(path);
-    if (dir_idx == -1) {
-        vga::print("Error: directory not found\n");
-        return -1;
+bool create_directory(const char* path) {
+    switch (current_fs) {
+        case FS_NTFS: return ntfs::create_directory(path);
+        case FS_FAT32: return fat32::create_directory(path);
+        case FS_MEMORY: return ntfs::create_directory(path);
+        default: return false;
     }
-    
-    uint32_t child_idx = files[dir_idx].first_child;
-    if (child_idx == -1) {
-        vga::print("Empty directory\n");
-        return 0;
-    }
-    
-    while (child_idx != -1) {
-        if (files[child_idx].type == FileType::Directory) {
-            vga::put_string("[DIR]  ", vga::Color::LightBlue, vga::Color::Black);
-        } else {
-            vga::put_string("[FILE] ", vga::Color::LightGreen, vga::Color::Black);
-        }
-        vga::print("%s\n", files[child_idx].name);
-        child_idx = files[child_idx].next_file;
-    }
-    
-    return 0;
 }
 
-int fview(const char* path) {
-    char dir_part[MAX_PATH];
-    char name[MAX_FILENAME];
-    split_path(path, dir_part, name);
-    
-    uint32_t dir_idx = find_dir(dir_part);
-    if (dir_idx == -1) {
-        vga::print("Error: directory not found\n");
-        return -1;
+bool read_file(const char* path, uint8_t* buffer, uint32_t max_size, uint32_t* bytes_read) {
+    switch (current_fs) {
+        case FS_NTFS: return ntfs::read_file(path, buffer, max_size, bytes_read);
+        case FS_FAT32: return fat32::read_file(path, buffer, max_size, bytes_read);
+        case FS_MEMORY: return ntfs::read_file(path, buffer, max_size, bytes_read);
+        default: return false;
     }
-    
-    uint32_t child_idx = files[dir_idx].first_child;
-    while (child_idx != -1) {
-        if (strcmp(files[child_idx].name, name) == 0 && 
-            files[child_idx].type == FileType::File) {
-            vga::print((const char*)files[child_idx].data);
-            vga::print("\n");
-            return 0;
-        }
-        child_idx = files[child_idx].next_file;
-    }
-    
-    vga::print("Error: file not found\n");
-    return -1;
 }
 
-int fedit(const char* path, const char* content) {
-    char dir_part[MAX_PATH];
-    char name[MAX_FILENAME];
-    split_path(path, dir_part, name);
-    
-    uint32_t dir_idx = find_dir(dir_part);
-    if (dir_idx == -1) {
-        vga::print("Error: directory not found\n");
-        return -1;
+bool write_file(const char* path, const uint8_t* data, uint32_t size) {
+    switch (current_fs) {
+        case FS_NTFS: return ntfs::write_file(path, data, size);
+        case FS_FAT32: return fat32::write_file(path, data, size);
+        case FS_MEMORY: return ntfs::write_file(path, data, size);
+        default: return false;
     }
-    
-    uint32_t child_idx = files[dir_idx].first_child;
-    while (child_idx != -1) {
-        if (strcmp(files[child_idx].name, name) == 0 && 
-            files[child_idx].type == FileType::File) {
-            if (content) {
-                size_t len = strlen(content);
-                if (len > MAX_FILE_SIZE) len = MAX_FILE_SIZE;
-                memcpy(files[child_idx].data, content, len);
-                files[child_idx].size = len;
-            }
-            return 0;
-        }
-        child_idx = files[child_idx].next_file;
-    }
-    
-    vga::print("Error: file not found\n");
-    return -1;
-}
-
-int remove(const char* path) {
-    char dir_part[MAX_PATH];
-    char name[MAX_FILENAME];
-    split_path(path, dir_part, name);
-    
-    uint32_t dir_idx = find_dir(dir_part);
-    if (dir_idx == -1) {
-        vga::print("Error: directory not found\n");
-        return -1;
-    }
-    
-    uint32_t child_idx = files[dir_idx].first_child;
-    uint32_t prev_idx = -1;
-    
-    while (child_idx != -1) {
-        if (strcmp(files[child_idx].name, name) == 0) {
-            if (files[child_idx].type == FileType::Directory) {
-                if (files[child_idx].first_child != -1) {
-                    vga::print("Error: directory not empty\n");
-                    return -1;
-                }
-            }
-            
-            if (prev_idx == -1) {
-                files[dir_idx].first_child = files[child_idx].next_file;
-            } else {
-                files[prev_idx].next_file = files[child_idx].next_file;
-            }
-            
-            files[child_idx].next_file = free_file;
-            free_file = child_idx;
-            return 0;
-        }
-        prev_idx = child_idx;
-        child_idx = files[child_idx].next_file;
-    }
-    
-    vga::print("Error: file not found\n");
-    return -1;
-}
-
-int rename(const char* old_path, const char* new_name) {
-    char dir_part[MAX_PATH];
-    char old_name[MAX_FILENAME];
-    split_path(old_path, dir_part, old_name);
-    
-    if (strlen(new_name) >= MAX_FILENAME) {
-        vga::print("Error: new filename too long\n");
-        return -1;
-    }
-    
-    uint32_t dir_idx = find_dir(dir_part);
-    if (dir_idx == -1) {
-        vga::print("Error: directory not found\n");
-        return -1;
-    }
-    
-    uint32_t child_idx = files[dir_idx].first_child;
-    while (child_idx != -1) {
-        if (strcmp(files[child_idx].name, new_name) == 0) {
-            vga::print("Error: file already exists\n");
-            return -1;
-        }
-        child_idx = files[child_idx].next_file;
-    }
-    
-    child_idx = files[dir_idx].first_child;
-    while (child_idx != -1) {
-        if (strcmp(files[child_idx].name, old_name) == 0) {
-            strcpy(files[child_idx].name, new_name);
-            return 0;
-        }
-        child_idx = files[child_idx].next_file;
-    }
-    
-    vga::print("Error: file not found\n");
-    return -1;
 }
 
 const char* get_current_dir() {
-    return current_path;
-}
-
-void set_current_dir(const char* path) {
-    uint32_t dir_idx = find_dir(path);
-    if (dir_idx != -1) {
-        strcpy(current_path, path);
-    } else {
-        vga::print("Error: directory not found\n");
+    switch (current_fs) {
+        case FS_NTFS: return ntfs::get_current_dir();
+        case FS_FAT32: return fat32::get_current_dir();
+        case FS_MEMORY: return ntfs::get_current_dir();
+        default: return "/";
     }
 }
 
+bool set_current_dir(const char* path) {
+    switch (current_fs) {
+        case FS_NTFS: return ntfs::set_current_dir(path);
+        case FS_FAT32: return fat32::set_current_dir(path);
+        case FS_MEMORY: return ntfs::set_current_dir(path);
+        default: return false;
+    }
 }
+
+bool delete_file(const char* path) {
+    switch (current_fs) {
+        case FS_NTFS: return ntfs::delete_file(path);
+        case FS_FAT32: return fat32::delete_file(path);
+        case FS_MEMORY: return ntfs::delete_file(path);
+        default: return false;
+    }
+}
+
+void print_filesystem_info() {
+    switch (current_fs) {
+        case FS_NTFS: ntfs::print_filesystem_info(); break;
+        case FS_FAT32: fat32::print_filesystem_info(); break;
+        case FS_MEMORY: ntfs::print_filesystem_info(); break;
+        default: vga::print("No filesystem initialized\n");
+    }
+}
+
+void format_drive(uint16_t drive) {
+    switch (current_fs) {
+        case FS_NTFS: ntfs::format_drive(drive); break;
+        case FS_FAT32: fat32::format_drive(drive); break;
+        case FS_MEMORY: vga::print("Cannot format memory filesystem\n"); break;
+        default: vga::print("No filesystem to format\n");
+    }
+}
+
+} // namespace fs

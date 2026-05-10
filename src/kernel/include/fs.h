@@ -1,42 +1,32 @@
-#pragma once
+#ifndef FS_H
+#define FS_H
 
 #include <stdint.h>
-#include <stddef.h>
 
 namespace fs {
 
-constexpr size_t MAX_FILES = 128;
-constexpr size_t MAX_FILENAME = 12;
-constexpr size_t MAX_FILE_SIZE = 4096;
-constexpr size_t MAX_PATH = 256;
-
-enum class FileType {
-    None,
-    File,
-    Directory
+enum FilesystemType {
+    FS_NONE,
+    FS_NTFS,
+    FS_FAT32,
+    FS_MEMORY
 };
 
-struct File {
-    char name[MAX_FILENAME];
-    FileType type;
-    uint32_t size;
-    uint8_t data[MAX_FILE_SIZE];
-    uint32_t parent_dir;
-    uint32_t next_file;
-    uint32_t first_child;
-};
-
-extern uint32_t free_file;
-
-void init();
-int mkdir(const char* path);
-int mkfile(const char* path, const char* content = "");
-int ls(const char* path);
-int fview(const char* path);
-int fedit(const char* path, const char* content);
-int remove(const char* path);
-int rename(const char* old_path, const char* new_name);
+FilesystemType get_fs_type();
+const char* get_fs_type_name();
+bool init();
+bool is_ready();
+bool list_directory(const char* path, void (*callback)(const char*, uint8_t, uint32_t));
+bool create_file(const char* path, uint8_t attributes);
+bool create_directory(const char* path);
+bool read_file(const char* path, uint8_t* buffer, uint32_t max_size, uint32_t* bytes_read);
+bool write_file(const char* path, const uint8_t* data, uint32_t size);
 const char* get_current_dir();
-void set_current_dir(const char* path);
+bool set_current_dir(const char* path);
+bool delete_file(const char* path);
+void print_filesystem_info();
+void format_drive(uint16_t drive);
 
-}
+} // namespace fs
+
+#endif
